@@ -1,3 +1,4 @@
+
 #include <ESP32Servo.h>
 #include <Adafruit_NeoPixel.h>
 #include <math.h>
@@ -8,7 +9,6 @@
 const char* ssid = "RUNI-Wireless";
 const char* password = "";
 const char* ntpServer = "pool.ntp.org";
-// Israel local time, including automatic daylight-saving adjustment.
 const char* timeZone = "IST-2IDT,M3.4.4/26,M10.5.0";
 
 // ======= SERVO & BUTTON CONFIG =======
@@ -19,9 +19,8 @@ Servo myservo;
 bool servoBusy = false;
 bool waitingForServo = false;
 unsigned long pressTime = 0;
-const unsigned long preServoDelay = 100; // 0.1 seconds before servo moves
+const unsigned long preServoDelay = 100;
 
-// Track the date on which the daily servo return has already happened.
 int lastResetYear = -1;
 int lastResetDay = -1;
 
@@ -29,6 +28,7 @@ int lastResetDay = -1;
 #define LED_PIN 15
 #define LED_COUNT 120
 #define PIXELS_PER_PRESS 20
+
 Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 
 struct FlickerPixel {
@@ -45,142 +45,204 @@ int pressCount = 0;
 const int maxPresses = 6;
 bool celebrationDone = false;
 
+// ======= TIMING =======
+const unsigned long ledUpdateInterval = 20;
+const unsigned long celebrationFrameInterval = 100;
+
+unsigned long lastLedUpdate = 0;
+unsigned long lastCelebrationFrame = 0;
+
+bool celebrationActive = false;
+int celebrationFrame = 0;
+const int celebrationTotalFrames = 40;
+
+// ======= NTP STATE =======
+bool ntpConfigured = false;
+bool timeIsSynced = false;
+
+// ======= SETUP =======
 void setup() {
   Serial.begin(115200);
 
-  // Servo setup
   pinMode(buttonPin, INPUT_PULLDOWN);
+
   ESP32PWM::allocateTimer(0);
   ESP32PWM::allocateTimer(1);
   ESP32PWM::allocateTimer(2);
   ESP32PWM::allocateTimer(3);
+
   myservo.setPeriodHertz(50);
   myservo.attach(servoPin, 500, 2500);
-  myservo.write(70); // Initial up position
+  myservo.write(70);
 
-  // LED setup
   strip.begin();
-  strip.show();
   strip.setBrightness(150);
+  strip.show();
 
-  // Connect to Wi-Fi and synchronize the ESP32 clock with NTP.
   Serial.print("Connecting to ");
   Serial.println(ssid);
+
   WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("\nWiFi connected.");
 
-  configTzTime(timeZone, ntpServer);
-
-  // Wait for the first successful time synchronization.
-  struct tm timeinfo;
-  while (!getLocalTime(&timeinfo, 1000)) {
-    Serial.println("Waiting for NTP time synchronization...");
-  }
-  Serial.println(&timeinfo, "Local time: %Y-%m-%d %H:%M:%S");
-
-  // Wi-Fi is no longer needed; the ESP32 system clock keeps running.
-  WiFi.disconnect(true);
-  WiFi.mode(WIFI_OFF);
-
-  Serial.println("Setup complete. Press the button to activate.");
+  Serial.println("Setup complete.");
 }
 
+// ======= MAIN LOOP =======
 void loop() {
   unsigned long now = millis();
-  bool currentButtonState = digitalRead(buttonPin) == HIGH;
 
-  // === Return the servo to its initial position once every day at 03:00 ===
+  // === NTP synchronization ===
+  if (!ntpConfigured && WiFi.status() == WL_CONNECTED) {
+    configTzTime(timeZone, ntpServer);
+    ntpConfigured = true;
+    Serial.println("WiFi connected. NTP synchronization started.");
+  }
+
   struct tm timeinfo;
-  if (getLocalTime(&timeinfo, 10)) {
-    if (timeinfo.tm_hour == 3 &&
-        lastResetYear != timeinfo.tm_year &&
-        lastResetDay != timeinfo.tm_yday) {
-      Serial.println("03:00 - Moving Servo up");
-      myservo.write(70); // Return servo to initial up position
-      servoBusy = false; // Allow the next day's button press
-      lastResetYear = timeinfo.tm_year;
-      lastResetDay = timeinfo.tm_yday;
-    }
+  bool haveTime = timeIsSynced && getLocalTime(&timeinfo, 0);
+
+  if (!timeIsSynced && ntpConfigured &&
+      getLocalTime(&timeinfo, 0)) {
+
+    timeIsSynced = true;
+
+    Serial.println(&timeinfo,
+      "Local time: %Y-%m-%d %H:%M:%S");
+
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    Serial.println("WiFi turned off.");
+    haveTime = true;
+  }
+
+  // === Daily servo reset at 03:00 ===
+  if (haveTime &&
+      timeinfo.tm_hour == 3 &&
+      (lastResetYear != timeinfo.tm_year ||
+       lastResetDay != timeinfo.tm_yday)) {
+
+    Serial.println("03:00 - Moving Servo up");
+
+    myservo.write(70);
+    servoBusy = false;
+
+    lastResetYear = timeinfo.tm_year;
+    lastResetDay = timeinfo.tm_yday;
   }
 
   // === Button press ===
-  if (currentButtonState && !prevButtonState && !servoBusy && !waitingForServo) {
+  bool currentButtonState = digitalRead(buttonPin) == HIGH;
+
+  if (currentButtonState && !prevButtonState &&
+      !servoBusy && !waitingForServo) {
+
     if (pressCount >= maxPresses) {
       Serial.println("Max presses reached. Servo stays down.");
     } else {
       pressCount++;
+
       Serial.printf("Button pressed - Count: %d\n", pressCount);
+
       pressTime = now;
       waitingForServo = true;
 
-      // Add breathing pixels unless it's the 6th press
       if (pressCount < maxPresses) {
-        int nextPixel = currentPixelCount;
-        for (int i = 0; i < PIXELS_PER_PRESS && currentPixelCount < LED_COUNT; i++) {
-          activePixels[currentPixelCount++] = {nextPixel++, now};
-          Serial.printf("Pixel %d started breathing\n", nextPixel - 1);
+        for (int i = 0;
+             i < PIXELS_PER_PRESS && currentPixelCount < LED_COUNT;
+             i++) {
+
+          activePixels[currentPixelCount] = {
+            currentPixelCount, now
+          };
+
+          currentPixelCount++;
         }
       }
-    }
-  }
-  prevButtonState = currentButtonState;
 
-  // === After 0.1 seconds, move the servo down ===
-  if (waitingForServo && (now - pressTime >= preServoDelay)) {
-    Serial.println("0.1 seconds passed - Moving Servo down");
-    myservo.write(0); // Move down
-    waitingForServo = false;
-    servoBusy = true; // Keep it down until the daily 03:00 reset
-  }
-
-  // === LED Effect Section (unchanged) ===
-  if (pressCount == maxPresses && !celebrationDone) {
-    playCelebration();
-    celebrationDone = true;
-  } else if (celebrationDone) {
-    // Set all pixels to solid white
-    for (int i = 0; i < LED_COUNT; i++) {
-      strip.setPixelColor(i, strip.Color(255, 255, 255));
-    }
-    strip.show();
-    delay(50);
-  } else {
-    // Breathing animation for active pixels
-    strip.clear();
-    for (int i = 0; i < currentPixelCount; i++) {
-      FlickerPixel &p = activePixels[i];
-      unsigned long elapsed = now - p.startTime;
-      if (elapsed < 10000) {
-        float t = (elapsed % 2000) / 2000.0 * 2 * PI;
-        float brightness = (sin(t - PI / 2) + 1.0) / 2.0;
-        int whiteValue = (int)(brightness * 255);
-        strip.setPixelColor(p.pixelIndex, strip.Color(whiteValue, whiteValue, whiteValue));
-      } else if (elapsed < 20000) {
-        strip.setPixelColor(p.pixelIndex, strip.Color(0, 0, 0));
-      } else {
-        strip.setPixelColor(p.pixelIndex, strip.Color(255, 255, 255));
+      // Start non-blocking celebration on the 6th press
+      if (pressCount == maxPresses && !celebrationDone) {
+        celebrationActive = true;
+        celebrationDone = true;
+        celebrationFrame = 0;
+        lastCelebrationFrame = now;
       }
     }
-    strip.show();
-    delay(20);
   }
-}
 
-// ===== Celebration Mode =====
-void playCelebration() {
-  Serial.println("🎉 Playing celebration animation!");
-  for (int j = 0; j < 40; j++) { // 40 flashes ~4 seconds
-    for (int i = 0; i < LED_COUNT; i++) {
-      int r = random(0, 256);
-      int g = random(0, 256);
-      int b = random(0, 256);
-      strip.setPixelColor(i, strip.Color(r, g, b));
+  prevButtonState = currentButtonState;
+
+  // === Move servo down after 100ms ===
+  if (waitingForServo &&
+      (unsigned long)(now - pressTime) >= preServoDelay) {
+
+    Serial.println("Moving Servo down");
+
+    myservo.write(0);
+    waitingForServo = false;
+    servoBusy = true;
+  }
+
+  // === Non-blocking celebration ===
+  if (celebrationActive) {
+
+    if ((unsigned long)(now - lastCelebrationFrame) >=
+        celebrationFrameInterval) {
+
+      lastCelebrationFrame = now;
+
+      for (int i = 0; i < LED_COUNT; i++) {
+        int r = random(0, 256);
+        int g = random(0, 256);
+        int b = random(0, 256);
+
+        strip.setPixelColor(i, strip.Color(r, g, b));
+      }
+
+      strip.show();
+      celebrationFrame++;
+
+      if (celebrationFrame >= celebrationTotalFrames) {
+        celebrationActive = false;
+        Serial.println("Celebration finished.");
+      }
     }
+
+  } else if ((unsigned long)(now - lastLedUpdate) >=
+             ledUpdateInterval) {
+
+    lastLedUpdate = now;
+
+    // === LED schedule: 21:00 - 06:00 ===
+    bool nightLighting = haveTime &&
+        (timeinfo.tm_hour >= 21 || timeinfo.tm_hour < 6);
+
+    strip.clear();
+
+    for (int i = 0; i < currentPixelCount; i++) {
+      FlickerPixel &p = activePixels[i];
+
+      unsigned long elapsed = now - p.startTime;
+
+      if (elapsed < 10000) {
+        // Breathing effect for 10 seconds
+        float t = (elapsed % 2000) / 2000.0f * 2 * PI;
+        float brightness = (sin(t - PI / 2) + 1.0f) / 2.0f;
+        int whiteValue = (int)(brightness * 255);
+
+        strip.setPixelColor(
+          p.pixelIndex,
+          strip.Color(whiteValue, whiteValue, whiteValue)
+        );
+
+      } else if (nightLighting) {
+        // Stay on until 06:00
+        strip.setPixelColor(
+          p.pixelIndex,
+          strip.Color(255, 255, 255)
+        );
+      }
+    }
+
     strip.show();
-    delay(100);
   }
 }
